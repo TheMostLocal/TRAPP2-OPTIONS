@@ -1,0 +1,27 @@
+# Core options universe — always refreshed (3x per market day).
+# Holdings, open bot positions and data/requests.txt are added automatically.
+AAPL
+MSFT
+NVDA
+GOOGL
+AMZN
+META
+TSLA
+AMD
+NFLX
+AVGO
+JPM
+BAC
+V
+MA
+DIS
+SPY
+QQQ
+IWM
+TSM
+COST
+WMT
+XOM
+CVX
+KO
+PEP

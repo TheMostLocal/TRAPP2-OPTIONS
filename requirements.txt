@@ -1,0 +1,4 @@
+# TRAPP2-OPTIONS — Python dependencies for pipeline/fetch_options.py
+# (setup-python's pip cache keys on this file; the workflow installs from it)
+yfinance>=0.2.50,<0.3
+pandas>=2.0

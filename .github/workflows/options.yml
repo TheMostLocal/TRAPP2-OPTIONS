@@ -1,0 +1,113 @@
+name: Options Chains
+
+# TRAPP2-OPTIONS (z90) — chains live in their own repo so 150+ tickers refreshed
+# several times a day don't bloat the equity books.
+#   core  : seed list + requests + portfolio holdings + open bot positions (3x per market day)
+#   broad : core + the 150 largest US equities/ETFs (once, after the close)
+#   every chain also appends a constant-maturity IV-surface snapshot to
+#   data/surfaces/<T>.json (Data tab time scrubber)
+#   dispatch with `tickers` : just those tickers, and they're appended to
+#                             data/requests.txt so they stay covered (the app's
+#                             "Request options" button uses this)
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'     # core  · 10:00 ET
+    - cron: '0 17 * * 1-5'     # core  · 13:00 ET
+    - cron: '30 20 * * 1-5'    # broad · 16:30 ET (after the close)
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Comma-separated tickers to fetch now (and keep covered)'
+        required: false
+        default: ''
+      tier:
+        description: 'core or broad (ignored when tickers is set)'
+        required: false
+        default: 'core'
+
+concurrency:
+  group: options-data          # shared with compact.yml - never two writers at once
+  cancel-in-progress: false
+
+jobs:
+  options:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start from the latest main (z117)
+        # A queued run checks out the commit it was TRIGGERED on and can wait a long
+        # time in its concurrency group. Committing from that stale tree and then
+        # merging "ours" overwrites newer work (2026-10-16: intraday tape points lost).
+        run: |
+          git fetch -q origin "${{ github.ref_name }}" && { git merge -q --ff-only FETCH_HEAD || git reset -q --hard FETCH_HEAD; }
+          echo "at $(git rev-parse --short HEAD)"
+
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt   # z113: the cache needs a requirements file to key on
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Self-test (offline, ~1s) - stop before touching data if the code is broken
+        # z117: the test was uploaded as pipeline/test_options.py, so "tests/..." failed
+        # this step on every run since z114 - no chains committed after 2026-10-15 14:00 UTC.
+        run: |
+          T=tests/test_options.py; [ -f "$T" ] || T=pipeline/test_options.py
+          python "$T"
+
+      - name: Pick the tier
+        id: tier
+        run: |
+          T="${{ github.event.inputs.tier }}"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "30 20 * * 1-5" ]; then T=broad; fi
+          echo "tier=${T:-core}" >> "$GITHUB_OUTPUT"
+
+      - name: Remember requested tickers
+        if: ${{ github.event.inputs.tickers != '' }}
+        run: |
+          for t in $(echo "${{ github.event.inputs.tickers }}" | tr ',' ' '); do
+            T=$(echo "$t" | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z0-9.-')
+            [ -n "$T" ] && ! grep -qx "$T" data/requests.txt && echo "$T" >> data/requests.txt
+          done
+          tail -5 data/requests.txt
+
+      - name: Fetch options chains + Greeks
+        env:
+          OPTIONS_TICKERS: ${{ github.event.inputs.tickers }}
+          OPTIONS_TIER: ${{ steps.tier.outputs.tier }}
+          BROAD_TOP_N: '150'
+          MAX_EXPIRIES: '10'
+          NEAR_COUNT: '3'
+          NEAR_MAX_DTE: '45'
+          MONTHLY_MAX_DTE: '120'
+          LEAP_MIN_DTE: '180'
+          LEAP_COUNT: '3'
+          STRIKE_PCT: '0.25'
+          TIME_BUDGET_SEC: '4000'
+        run: python pipeline/fetch_options.py
+
+      - name: Commit & push (scoped, retry, never force)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # z116: one path per git add - a single missing path makes git reject the
+          # whole command and stage nothing (the bug that froze the bot's state)
+          for f in data/options data/surfaces data/requests.txt; do
+            if [ -e "$f" ] || git ls-files --error-unmatch "$f" >/dev/null 2>&1; then git add -A "$f"; fi
+          done
+          if git diff --staged --quiet; then echo "No options changes"; exit 0; fi
+          git commit -m "Options chains (${{ steps.tier.outputs.tier }}) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          for i in 1 2 3 4 5; do
+            if git push; then echo "pushed on attempt $i"; exit 0; fi
+            git fetch origin && git merge -X ours origin/main -m "merge remote" || true
+            sleep $((i * 5))
+          done
+          echo "::error::push failed after 5 attempts"; exit 1
