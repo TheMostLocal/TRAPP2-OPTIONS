@@ -1,3 +1,4 @@
 # On-demand options coverage requests (one ticker per line).
 # The app's 'Request options' button dispatches the workflow with a ticker;
 # the workflow appends it here so it stays covered.
+GME
