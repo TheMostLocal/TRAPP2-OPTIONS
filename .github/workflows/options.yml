@@ -11,9 +11,13 @@ name: Options Chains
 #                             "Request options" button uses this)
 on:
   schedule:
-    - cron: '0 14 * * 1-5'     # core  · 10:00 ET
-    - cron: '0 17 * * 1-5'     # core  · 13:00 ET
-    - cron: '30 20 * * 1-5'    # broad · 16:30 ET (after the close)
+    # z134: cron is UTC - each run is listed for EDT and EST; the gate job keeps the one at the ET time
+    - cron: '0 14 * * 1-5'     # core  · 10:00 EDT
+    - cron: '0 15 * * 1-5'     # core  · 10:00 EST
+    - cron: '0 17 * * 1-5'     # core  · 13:00 EDT
+    - cron: '0 18 * * 1-5'     # core  · 13:00 EST
+    - cron: '30 20 * * 1-5'    # broad · 16:30 EDT (after the close)
+    - cron: '30 21 * * 1-5'    # broad · 16:30 EST (after the close)
   workflow_dispatch:
     inputs:
       tickers:
@@ -30,7 +34,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  gate:
+    # z134: GitHub cron runs on UTC. Every run is scheduled at BOTH offsets (EDT = UTC-4, EST =
+    # UTC-5); this gate turns the cron's UTC hour into today's Eastern hour and keeps only the
+    # run that lands on the intended ET time - so "after the close" stays after the close all year.
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+      tier: ${{ steps.g.outputs.tier }}
+    steps:
+      - id: g
+        name: Eastern-time gate
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; echo "tier=" >> "$GITHUB_OUTPUT"; exit 0; fi
+          S="${{ github.event.schedule }}"
+          OFF=$(TZ=America/New_York date +%z)                 # -0400 (EDT) or -0500 (EST)
+          OFFH=$((10#${OFF:1:2}))
+          UM=$(echo "$S" | awk '{print $1}'); UH=$(echo "$S" | awk '{print $2}')
+          ETH=$(( (10#$UH - OFFH + 24) % 24 )); ETM=$(printf '%02d' "$UM")
+          case "${ETH}:${ETM}" in
+            10:00|13:00) RUN=true; T=core ;;
+            16:30) RUN=true; T=broad ;;
+            *) RUN=false; T= ;;
+          esac
+          echo "schedule '$S' = ${ETH}:${ETM} ET today (UTC${OFF}) -> run=${RUN} tier=${T:-default}"
+          echo "run=${RUN}" >> "$GITHUB_OUTPUT"; echo "tier=${T}" >> "$GITHUB_OUTPUT"
   options:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 75
     permissions:
@@ -67,7 +98,7 @@ jobs:
         id: tier
         run: |
           T="${{ github.event.inputs.tier }}"
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "30 20 * * 1-5" ]; then T=broad; fi
+          [ -n "${{ needs.gate.outputs.tier }}" ] && T="${{ needs.gate.outputs.tier }}"   # z134: scheduled runs: the gate's ET tier
           echo "tier=${T:-core}" >> "$GITHUB_OUTPUT"
 
       - name: Remember requested tickers
