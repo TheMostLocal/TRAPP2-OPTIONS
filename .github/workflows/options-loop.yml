@@ -1,0 +1,47 @@
+# ============================================================
+#  >>> DESTINATION: TheMostLocal/TRAPP2-OPTIONS
+#  >>> FILE PATH:   .github/workflows/options-loop.yml
+#
+#  z148 - option chains as often as the intraday tape: a pass every 15 min in the session (0935-1605 ET)
+#  over the CORE universe (incl. every position the bot holds), oldest chains first. Hourly triggers at
+#  :09 (off the busy :00) queue behind the running job; same concurrency group as options.yml (the
+#  after-close BROAD run at 1630 ET) and compact.yml, so writers never overlap. Replaces the 1000 / 1300
+#  ET core runs.
+# ============================================================
+name: Options Chains · intraday (core, every 15 min)
+
+on:
+  schedule:
+    - cron: '9 13-20 * * 1-5'    # 0909-1609 EDT / 0809-1509 EST; the job itself waits for 0935 ET and stops at 1605 ET
+  workflow_dispatch:
+
+concurrency:
+  group: options-data
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Core chains every 15 min (:05 / :20 / :35 / :50)
+        env:
+          LOOP_BUDGET_MIN: '170'
+          PASS_BUDGET_SEC: '540'
+          MAX_EXPIRIES: '10'
+          NEAR_COUNT: '3'
+          NEAR_MAX_DTE: '45'
+          MONTHLY_MAX_DTE: '120'
+          LEAP_MIN_DTE: '180'
+          LEAP_COUNT: '3'
+          STRIKE_PCT: '0.25'
+        run: bash pipeline/options_loop.sh
