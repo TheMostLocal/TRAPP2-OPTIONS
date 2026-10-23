@@ -12,10 +12,8 @@ name: Options Chains
 on:
   schedule:
     # z134: cron is UTC - each run is listed for EDT and EST; the gate job keeps the one at the ET time
-    - cron: '0 14 * * 1-5'     # core  · 10:00 EDT
-    - cron: '0 15 * * 1-5'     # core  · 10:00 EST
-    - cron: '0 17 * * 1-5'     # core  · 13:00 EDT
-    - cron: '0 18 * * 1-5'     # core  · 13:00 EST
+    # z148: the core chains now refresh every 15 min in the session (options-loop.yml); this workflow keeps
+    # the after-close BROAD run - every US equity / ETF in the books up to the top 400, oldest first
     - cron: '30 20 * * 1-5'    # broad · 16:30 EDT (after the close)
     - cron: '30 21 * * 1-5'    # broad · 16:30 EST (after the close)
   workflow_dispatch:
@@ -53,7 +51,6 @@ jobs:
           UM=$(echo "$S" | awk '{print $1}'); UH=$(echo "$S" | awk '{print $2}')
           ETH=$(( (10#$UH - OFFH + 24) % 24 )); ETM=$(printf '%02d' "$UM")
           case "${ETH}:${ETM}" in
-            10:00|13:00) RUN=true; T=core ;;
             16:30) RUN=true; T=broad ;;
             *) RUN=false; T= ;;
           esac
@@ -63,7 +60,7 @@ jobs:
     needs: gate
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     permissions:
       contents: write
     steps:
@@ -114,7 +111,7 @@ jobs:
         env:
           OPTIONS_TICKERS: ${{ github.event.inputs.tickers }}
           OPTIONS_TIER: ${{ steps.tier.outputs.tier }}
-          BROAD_TOP_N: '150'
+          BROAD_TOP_N: '400'          # z148: the books' US equities / ETFs (oldest first, the time budget rotates the tail)
           MAX_EXPIRIES: '10'
           NEAR_COUNT: '3'
           NEAR_MAX_DTE: '45'
