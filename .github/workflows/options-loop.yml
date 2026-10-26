@@ -21,6 +21,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write          # z161: the loop queues its own next run
 
 jobs:
   loop:
@@ -36,6 +37,7 @@ jobs:
       - name: Core chains every 15 min (:05 / :20 / :35 / :50)
         env:
           LOOP_BUDGET_MIN: '170'
+          GH_TOKEN: ${{ github.token }}
           PASS_BUDGET_SEC: '540'
           MAX_EXPIRIES: '10'
           NEAR_COUNT: '3'
