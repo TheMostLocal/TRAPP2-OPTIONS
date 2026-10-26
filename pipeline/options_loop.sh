@@ -50,6 +50,22 @@ next_wait() {   # seconds to the next :05 / :20 / :35 / :50, at least 60 s away
   [ "$w" -lt 60 ] && w=$(( w + 900 ))
   echo "$w"
 }
+# z161: when this job stops for its TIME BUDGET while its window is still open, it queues the next run of its own
+# workflow - GitHub's scheduler went hours without starting anything (2026-10-26: no intraday run by 0900 ET).
+# Needs `actions: write` and GH_TOKEN (the job's own token) in the workflow; the concurrency group queues the new
+# run behind this one. GitHub's schedule and the Supabase heartbeat (supabase/heartbeat.sql) stay as backstops.
+chain_next() {
+  [ -n "${GH_TOKEN:-}" ] || { echo "::notice::GH_TOKEN not set - not chaining"; return 0; }
+  local wf="${GITHUB_WORKFLOW_REF:-}"
+  wf="${wf%@*}"; wf="${wf##*/}"
+  { [ -n "$wf" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; } || return 0
+  if gh workflow run "$wf" --ref "${GITHUB_REF_NAME:-main}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+    echo "chained: the next run of $wf is queued"
+  else
+    echo "::warning::could not queue the next run of $wf (does the workflow grant actions: write?)"
+  fi
+}
+
 left() { echo $(( BUDGET - ( $(date +%s) - START ) )); }
 
 i=0
@@ -66,7 +82,7 @@ while :; do
   echo "── pass $i · $(TZ=America/New_York date +'%a %H:%M') ET"
   one_pass
   w=$(next_wait)
-  [ $(( w + PASS + 120 )) -gt "$(left)" ] && { echo "budget reached after $i pass(es) - the next queued job takes over"; break; }
+  [ $(( w + PASS + 120 )) -gt "$(left)" ] && { echo "budget reached after $i pass(es) - queueing the next run"; chain_next; break; }
   echo "  next pass in $(( w / 60 )) min"
   sleep "$w"
 done
