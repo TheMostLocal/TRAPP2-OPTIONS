@@ -25,3 +25,18 @@ XOM
 CVX
 KO
 PEP
+# z164: macro instruments - so the bot can buy calls / puts on countries, bonds, the dollar and commodities
+EWZ
+EWW
+FXI
+EWJ
+INDA
+TLT
+IEF
+HYG
+LQD
+EMB
+UUP
+GLD
+SLV
+USO
