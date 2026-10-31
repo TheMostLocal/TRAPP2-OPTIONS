@@ -72,10 +72,21 @@ i=0
 while :; do
   weekday || { echo "weekend - no session"; break; }
   m=$(et_min)
-  if [ "$m" -ge "$CLOSE" ]; then echo "after 1605 ET - the after-close broad run takes it from here"; break; fi
+  if [ "$m" -ge "$CLOSE" ]; then
+    # z168: Monday-Thursday the loop bridges the night (GitHub started few of its morning triggers on 10-26..10-30):
+    # wait to the end of this job and queue the next, which waits for tomorrow's 0935 ET; Friday it stops
+    if [ "$(TZ=America/New_York date +%u)" -le 4 ] && [ "${LOOP_BRIDGE:-1}" = "1" ]; then
+      l=$(left); echo "after 1605 ET - bridging the night: sleeping $(( (l - 180) / 60 )) min, then queueing the next run"
+      [ "$l" -gt 180 ] && sleep $(( l - 180 )); chain_next; break
+    fi
+    echo "after 1605 ET - the after-close broad run takes it from here"; break
+  fi
   if [ "$m" -lt "$OPEN" ]; then
     w=$(( (OPEN - m) * 60 ))
-    [ $(( w + 600 )) -gt "$(left)" ] && { echo "the session opens after this job's budget - the next job takes it"; break; }
+    if [ $(( w + 600 )) -gt "$(left)" ]; then
+      l=$(left); echo "the session opens after this job's budget - sleeping $(( (l - 180) / 60 )) min, then queueing the next run"
+      [ "$l" -gt 180 ] && sleep $(( l - 180 )); chain_next; break
+    fi
     echo "waiting $(( w / 60 )) min for 0935 ET"; sleep "$w"; continue
   fi
   i=$((i + 1))
