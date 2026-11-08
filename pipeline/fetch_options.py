@@ -163,7 +163,7 @@ def _read_universe():
     add([t.get("ticker") for t in (bot.get("trades") or []) if t.get("status") == "open"], "open bot positions")
     if os.environ.get("OPTIONS_TIER", "core").lower() == "broad":
         rows = []
-        for book in ("TRAPP2", "TRAPP2-2", "TRAPP2-3"):
+        for book in ("TRAPP2", "TRAPP2-2", "TRAPP2-3", "TRAPP2-4"):   # z178: + TRAPP2-4
             for r in (_get_json(f"{RAW}/{book}/main/data/master.json") or []):
                 if str(r.get("currency") or "USD").upper() != "USD":
                     continue
