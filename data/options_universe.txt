@@ -10,6 +10,8 @@ TSLA
 AMD
 NFLX
 AVGO
+# z195: Anthropic (IPO 11-19). Its options list a few sessions after the IPO - until then the fetch logs "no listed options"
+ANT
 JPM
 BAC
 V
