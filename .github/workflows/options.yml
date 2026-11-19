@@ -14,6 +14,9 @@ on:
     # z134: cron is UTC - each run is listed for EDT and EST; the gate job keeps the one at the ET time
     # z148: the core chains now refresh every 15 min in the session (options-loop.yml); this workflow keeps
     # the after-close BROAD run - every US equity / ETF in the books up to the top 400, oldest first
+    # z196: the broad pass (now every optionable name in the five books) runs inside options-loop.yml after 1605 ET -
+    # this 1630 ET run was cancelled Mon-Thu as the concurrency group's pending run. It stays as the backstop: when
+    # it does start, chains fetched this evening are skipped (BROAD_FRESH_H), so it only fills what the loop missed.
     - cron: '30 20 * * 1-5'    # broad · 16:30 EDT (after the close)
     - cron: '30 21 * * 1-5'    # broad · 16:30 EST (after the close)
   workflow_dispatch:
@@ -60,7 +63,7 @@ jobs:
     needs: gate
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150           # z196: the broad tier is ~2,300 names (a full pass ~30-60 min)
     permissions:
       contents: write
     steps:
@@ -111,7 +114,13 @@ jobs:
         env:
           OPTIONS_TICKERS: ${{ github.event.inputs.tickers }}
           OPTIONS_TIER: ${{ steps.tier.outputs.tier }}
-          BROAD_TOP_N: '400'          # z148: the books' US equities / ETFs (oldest first, the time budget rotates the tail)
+          BROAD_TOP_N: '0'            # z196: every optionable US equity / ETF in the five books (was the top 400)
+          FULL_TOP_N: '400'           # z196: full ladder for the core list + the 400 largest; lite ladder for the rest
+          TAIL_MAX_EXPIRIES: '6'
+          TAIL_NEAR_COUNT: '2'
+          TAIL_LEAP_COUNT: '1'
+          BROAD_FRESH_H: '10'
+          NOOPT_RECHECK_DAYS: '14'
           MAX_EXPIRIES: '10'
           NEAR_COUNT: '3'
           NEAR_MAX_DTE: '45'
@@ -119,7 +128,7 @@ jobs:
           LEAP_MIN_DTE: '180'
           LEAP_COUNT: '3'
           STRIKE_PCT: '0.25'
-          TIME_BUDGET_SEC: '4000'
+          TIME_BUDGET_SEC: '7200'     # z196: 2 h for the whole universe (oldest first; the next pass continues)
         run: python pipeline/fetch_options.py
 
       - name: Commit & push (scoped, retry, never force)
