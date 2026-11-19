@@ -9,6 +9,15 @@
 #  budget per pass, so every core chain - including each contract the bot holds - is re-read every
 #  15-30 minutes. Each pass commits on its own. One job runs up to LOOP_BUDGET_MIN; hourly triggers
 #  queue the next (concurrency group options-data, shared with the after-close broad run and compact).
+#
+#  z196 - THE BROAD PASS RUNS HERE, after 1605 ET, before the night bridge: every optionable US equity / ETF in
+#  the five books (~2,300; fetch_options.py OPTIONS_TIER=broad, full ladder for the core list + 400 largest, lite
+#  for the rest), oldest first, skipping chains fetched this evening. Why: options.yml's 1630 ET broad run waited
+#  in the shared concurrency group behind this loop's night bridge, and the bridge's own queued next run replaced
+#  it as the group's pending run - GitHub cancels a pending run when a newer one queues - so Monday-Thursday the
+#  broad chains never refreshed (on file: 11-07 and 11-13, both Fridays). data/options/_state.json says whether
+#  tonight's pass is complete; an incomplete one (time budget, Yahoo refusing) continues in this job or the next.
+#  LOOP_BROAD=0 turns it off (options.yml's broad run is still the backstop).
 # ============================================================
 set -u
 BUDGET=$(( ${LOOP_BUDGET_MIN:-170} * 60 ))
@@ -68,18 +77,49 @@ chain_next() {
 
 left() { echo $(( BUDGET - ( $(date +%s) - START ) )); }
 
+broad_due() {   # z196: tonight's broad pass not done yet? (no state file / another date / incomplete)
+  python - <<'PY'
+import json, sys, datetime
+from zoneinfo import ZoneInfo
+try:
+    b = (json.load(open("data/options/_state.json")) or {}).get("broad") or {}
+except Exception:
+    b = {}
+today = datetime.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+sys.exit(0 if (b.get("date") != today or b.get("complete") is not True) else 1)
+PY
+}
+BROAD_RUNS=0
+broad_pass() {   # z196: one broad pass inside this job's remaining budget, committed on its own
+  latest
+  local l budget
+  l=$(left); budget=$(( l - 480 ))
+  BROAD_RUNS=$((BROAD_RUNS + 1))
+  echo "── broad pass $BROAD_RUNS · $(TZ=America/New_York date +'%a %H:%M') ET · budget $(( budget / 60 )) min"
+  OPTIONS_TIER=broad TIME_BUDGET_SEC="$budget" python pipeline/fetch_options.py || echo "::warning::broad pass failed"
+  stage
+  if git diff --staged --quiet; then echo "  no changes"; return 0; fi
+  git commit -q -m "Options chains (broad - every optionable name in the books) $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]"
+  push_retry
+}
+
 i=0
 while :; do
   weekday || { echo "weekend - no session"; break; }
   m=$(et_min)
   if [ "$m" -ge "$CLOSE" ]; then
+    # z196: tonight's broad pass first (at most 3 tries in one job - a pass that keeps failing waits for the next job)
+    if [ "${LOOP_BROAD:-1}" = "1" ] && [ "$BROAD_RUNS" -lt 3 ] && broad_due; then
+      if [ "$(left)" -gt 900 ]; then broad_pass; continue; fi
+      echo "tonight's broad pass is due but under 15 min are left in this job - queueing the next run for it"; chain_next; break
+    fi
     # z168: Monday-Thursday the loop bridges the night (GitHub started few of its morning triggers on 10-26..10-30):
     # wait to the end of this job and queue the next, which waits for tomorrow's 0935 ET; Friday it stops
     if [ "$(TZ=America/New_York date +%u)" -le 4 ] && [ "${LOOP_BRIDGE:-1}" = "1" ]; then
       l=$(left); echo "after 1605 ET - bridging the night: sleeping $(( (l - 180) / 60 )) min, then queueing the next run"
       [ "$l" -gt 180 ] && sleep $(( l - 180 )); chain_next; break
     fi
-    echo "after 1605 ET - the after-close broad run takes it from here"; break
+    echo "after 1605 ET - Friday: no bridge (the broad pass is done or retried by options.yml's backstop)"; break
   fi
   if [ "$m" -lt "$OPEN" ]; then
     w=$(( (OPEN - m) * 60 ))
