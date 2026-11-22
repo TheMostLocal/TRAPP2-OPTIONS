@@ -1,0 +1,44 @@
+# Core options universe — always refreshed (3x per market day).
+# Holdings, open bot positions and data/requests.txt are added automatically.
+AAPL
+MSFT
+NVDA
+GOOGL
+AMZN
+META
+TSLA
+AMD
+NFLX
+AVGO
+# z195: Anthropic (IPO 11-19). Its options list a few sessions after the IPO - until then the fetch logs "no listed options"
+ANT
+JPM
+BAC
+V
+MA
+DIS
+SPY
+QQQ
+IWM
+TSM
+COST
+WMT
+XOM
+CVX
+KO
+PEP
+# z164: macro instruments - so the bot can buy calls / puts on countries, bonds, the dollar and commodities
+EWZ
+EWW
+FXI
+EWJ
+INDA
+TLT
+IEF
+HYG
+LQD
+EMB
+UUP
+GLD
+SLV
+USO

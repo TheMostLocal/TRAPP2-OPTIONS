@@ -1,0 +1,60 @@
+# ============================================================
+#  >>> DESTINATION: TheMostLocal/TRAPP2-OPTIONS
+#  >>> FILE PATH:   .github/workflows/options-loop.yml
+#
+#  z148 - option chains as often as the intraday tape: a pass every 15 min in the session (0935-1605 ET)
+#  over the CORE universe (incl. every position the bot holds), oldest chains first. Hourly triggers at
+#  :09 (off the busy :00) queue behind the running job; same concurrency group as options.yml (the
+#  after-close BROAD run at 1630 ET) and compact.yml, so writers never overlap. Replaces the 1000 / 1300
+#  ET core runs.
+#  z196 - after 1605 ET the job runs tonight's BROAD pass itself (every optionable US equity / ETF in the five
+#  books, ~2,300 names) before bridging the night: options.yml's 1630 ET run was cancelled Monday-Thursday as the
+#  group's pending run (see pipeline/options_loop.sh). options.yml stays as the backstop and for on-demand tickers.
+# ============================================================
+name: Options Chains · intraday (core, every 15 min)
+
+on:
+  schedule:
+    - cron: '9 13-20 * * 1-5'    # 0909-1609 EDT / 0809-1509 EST; the job itself waits for 0935 ET and stops at 1605 ET
+  workflow_dispatch:
+
+concurrency:
+  group: options-data
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write          # z161: the loop queues its own next run
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Core chains every 15 min (:05 / :20 / :35 / :50)
+        env:
+          LOOP_BUDGET_MIN: '170'
+          GH_TOKEN: ${{ github.token }}
+          PASS_BUDGET_SEC: '540'
+          MAX_EXPIRIES: '10'
+          NEAR_COUNT: '3'
+          NEAR_MAX_DTE: '45'
+          MONTHLY_MAX_DTE: '120'
+          LEAP_MIN_DTE: '180'
+          LEAP_COUNT: '3'
+          STRIKE_PCT: '0.25'
+          LOOP_BROAD: '1'             # z196: tonight's broad pass runs in this job after 1605 ET
+          BROAD_TOP_N: '0'            # z196: 0 = every optionable US equity / ETF in the five books
+          FULL_TOP_N: '400'           # z196: full ladder for the core list + the 400 largest; lite for the rest
+          TAIL_MAX_EXPIRIES: '6'
+          TAIL_NEAR_COUNT: '2'
+          TAIL_LEAP_COUNT: '1'
+          BROAD_FRESH_H: '10'         # a broad pass skips chains fetched this recently (this session / this evening)
+          NOOPT_RECHECK_DAYS: '14'    # names with no listed options are re-checked every 14 days
+        run: bash pipeline/options_loop.sh

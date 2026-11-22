@@ -1,0 +1,38 @@
+name: Compact history (weekly)
+
+# Chains are rewritten several times a day; old snapshots have no value in git.
+# Once a week (z196; was monthly - the broad pass now rewrites ~2,300 chains a night) this collapses the
+# repo to ONE commit holding the current files, keeping clone size bounded.
+#
+# This is the ONE place a workflow force-pushes, and it is safe here because:
+#   * TRAPP2-OPTIONS' writers (options.yml, options-loop.yml) and this squash share the
+#     `options-data` concurrency group, so the squash can never run while a fetch is writing
+#     (and the loop does not run on weekends).
+# Never copy this pattern into a repo with more than one writing workflow.
+on:
+  schedule:
+    - cron: '0 6 * * 0'        # z196: every Sunday 06:00 UTC (was the 1st of the month) - ~2,300 chains a night
+  workflow_dispatch:
+
+concurrency:
+  group: options-data
+  cancel-in-progress: false
+
+jobs:
+  compact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Squash to a single commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan compacted
+          git add -A
+          git commit -m "Compacted history $(date -u +%Y-%m-%d) (current chains + code)"
+          git push --force origin compacted:main
