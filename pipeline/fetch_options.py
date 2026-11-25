@@ -74,6 +74,22 @@ ranked names showed -2 to -655 (percentile 0), and the early warning's "IV rank 
   • IV rank: today's constant-maturity 30-day ATM IV (the history's own construct, in percent)
   • summary / breadth / market read: chains without quotes are flagged and kept out; market.json history rows whose
     median 30-day IV is under 5 % (impossible across ~2,000 stocks) are dropped
+
+z209 - THE 30-DAY HOLE AND DEALER GAMMA.
+  • The full ladder took the three nearest expiries, then monthlies only beyond 45 days: for a name with daily / weekly
+    expiries (SPY, QQQ, IWM, the large caps) nothing between ~5 and 51 days - SPY's "30-day" ATM IV, 25-delta skew,
+    expected move and term slope were read on the January expiry (51 days), and December's monthly (the quarter's
+    largest open interest) was not in the file. Now the ladder is built by priority - the near three, the expiry nearest
+    30 days (14-45), every monthly out to MONTHLY_MAX_DTE (December's included), the furthest, then the LEAPs - capped
+    at MAX_EXPIRIES (the LEAPs give way first).
+  • dealer_gamma(d) for the index ETFs (SPY, QQQ, IWM, DIA): open interest x Black-Scholes gamma on each contract's own
+    IV (parity mid, else a quoted Yahoo IV), in dollars per 1 % move (OI x gamma x 100 x S^2 x 1 %), calls + / puts -
+    (the usual convention: customers buy puts and sell calls, dealers take the other side - an assumption, said so);
+    the total, by tenor (0DTE in the session only, 1-7, 8-35, 36+ days), the gamma flip (where the total crosses zero as
+    the price moves, IVs held), the call wall / put wall (the largest call OI above / put OI below the price in the next
+    35 days), call / put OI by expiry. market.json "dealer" + "dealerHistory" (one row per symbol per day): the change
+    in put / call open interest on the expiries both days hold - Yahoo's OI is the prior session's close (OCC), so the
+    change is what the PRIOR session's trading did.
 """
 import json
 import math
@@ -409,18 +425,26 @@ def _select_expiries(all_exps, today, lite=False):
     if lite:
         return _select_lite(dated)
 
-    picked = []
+    picked = []                     # z209: in PRIORITY order - the cap below keeps the first MAX_EXPIRIES
 
     # (a) Nearest weeklies — always include the front few for short-dated trades.
     for e, d, dte in dated:
         if dte <= NEAR_MAX_DTE and len(picked) < NEAR_COUNT:
             picked.append(e)
 
-    # (b) Monthlies (third-Friday) out to MONTHLY_MAX_DTE — the liquid sweet spot.
+    # (a2) z209: the expiry nearest 30 days (14-45) - the 30-day reads (ATM IV, skew, expected move) need one
+    m30 = [x for x in dated if 14 <= x[2] <= NEAR_MAX_DTE]
+    if m30:
+        e30 = min(m30, key=lambda x: abs(x[2] - 30))[0]
+        if e30 not in picked:
+            picked.append(e30)
+
+    # (b) Monthlies (third-Friday) out to MONTHLY_MAX_DTE — the liquid sweet spot. z209: from the nearest one (December's
+    #     monthly at 24 days carries the quarter's largest open interest), not only beyond the near window
     for e, d, dte in dated:
         if e in picked:
             continue
-        if _third_friday(d) and NEAR_MAX_DTE < dte <= MONTHLY_MAX_DTE:
+        if _third_friday(d) and dte <= MONTHLY_MAX_DTE:
             picked.append(e)
 
     # (c) Bridge: if no monthly landed in the 45-120d window (some names lack
@@ -429,6 +453,11 @@ def _select_expiries(all_exps, today, lite=False):
         for e, d, dte in dated:
             if NEAR_MAX_DTE < dte <= MONTHLY_MAX_DTE and e not in picked:
                 picked.append(e); break
+
+    # Always include the single furthest-dated expiry (true long LEAP) - z209: before the LEAP spread, so the cap keeps it
+    furthest = dated[-1][0]
+    if furthest not in picked:
+        picked.append(furthest)
 
     # (d) LEAPS — the longest-dated expiries (6 months+). Prefer third-Friday
     #     monthlies (true LEAPS), then fall back to the furthest available.
@@ -446,18 +475,13 @@ def _select_expiries(all_exps, today, lite=False):
             if e not in picked:
                 picked.append(e)
 
-    # Always include the single furthest-dated expiry (true long LEAP) if room.
-    furthest = dated[-1][0]
-    if furthest not in picked:
-        picked.append(furthest)
-
-    # De-dupe, keep chronological order, cap at MAX_EXPIRIES.
-    seen = set()
-    ordered = []
-    for e, d, dte in dated:
-        if e in picked and e not in seen:
-            seen.add(e); ordered.append(e)
-    return ordered[:MAX_EXPIRIES]
+    # De-dupe, cap at MAX_EXPIRIES BY PRIORITY (z209: the LEAP spread gives way first), then chronological order.
+    keep, seen = [], set()
+    for e in picked:
+        if e not in seen:
+            seen.add(e); keep.append(e)
+    keep = set(keep[:MAX_EXPIRIES])
+    return [e for e, d, dte in dated if e in keep]
 
 
 def yahoo_iv(o):
@@ -997,6 +1021,118 @@ def summarize_chain(d):
     return out
 
 
+# ---- z209: dealer gamma from open interest (the index ETFs) --------------------------------------------------------
+DEALER_SYMS = ("SPY", "QQQ", "IWM", "DIA")
+DEALER_KEEP = 260                   # days of dealerHistory per symbol
+DEALER_GRID = (0.85, 1.15, 0.0025)  # the flip search: spot x 0.85 .. 1.15 in 0.25 % steps
+
+
+def _bs_gamma(S, K, T, sig, F=None, r=0.0):
+    """Spot gamma of a European option (Black-Scholes on the expiry's forward F; F = S when unknown)."""
+    if not (S and K and T and sig) or S <= 0 or K <= 0 or T <= 0 or sig <= 0:
+        return 0.0
+    F = F if (F and F > 0) else S
+    sq = sig * math.sqrt(T)
+    d1 = (math.log(F / K) + 0.5 * sig * sig * T) / sq
+    return math.exp(-r * T) * (F / S) * _norm_pdf(d1) / (S * sq)
+
+
+def _dealer_legs(d):
+    """(spot, r, [(K, T, sig, F, oi, sign, dte)]) for every contract with open interest and a usable IV (parity mid, else
+    a quoted Yahoo IV). 0DTE only while the chain is from that session (an expiring contract after the close is gone)."""
+    S, r = d.get("spot"), d.get("riskFreeRate") or 0.0
+    try:
+        at = datetime.datetime.fromisoformat(str(d.get("asOf") or "").replace("Z", "+00:00"))
+        at = at if at.tzinfo else at.replace(tzinfo=datetime.timezone.utc)
+        at_et = at.astimezone(ET)
+    except ValueError:
+        at_et = None
+    legs = []
+    for e in d.get("expiries") or []:
+        dte = e.get("dte")
+        if dte is None or dte < 0:
+            continue
+        if dte == 0:
+            m = at_et.hour * 60 + at_et.minute if at_et else None
+            if m is None or m >= 16 * 60 or str(e.get("expiry")) != at_et.date().isoformat():
+                continue
+            T = max((16 * 60 - m) / (6.5 * 60), 0.05) / 365.0     # the session left, as a fraction of a day
+        else:
+            T = dte / 365.0
+        F = e.get("forward") or S
+        for side, sign in (("calls", 1), ("puts", -1)):
+            for o in e.get(side) or []:
+                oi = o.get("openInterest") or 0
+                sig = _iv_of(o)
+                if oi > 0 and sig:
+                    legs.append((o["strike"], T, sig, F, oi, sign, dte))
+    return S, r, legs
+
+
+def _gex_at(S0, r, legs, S):
+    """Dealer dollar gamma per 1 % move at spot S (each expiry's forward moves with the spot)."""
+    tot = 0.0
+    for K, T, sig, F, oi, sign, _dte in legs:
+        tot += sign * _bs_gamma(S, K, T, sig, F * (S / S0), r) * oi * 100 * S * S * 0.01
+    return tot
+
+
+def dealer_gamma(d):
+    """z209 -> {spot, asOf, gex, byTenor {0dte, 1-7, 8-35, 36+}, flip, flipPct, callWall, putWall, callOI, putOI,
+    byExpiry {expiry: [callOI, putOI]}, legs} or None. Calls +, puts - (an assumption: dealers long the calls customers
+    sell, short the puts they buy)."""
+    S0, r, legs = _dealer_legs(d)
+    if not S0 or len(legs) < 20:
+        return None
+    by = {"0dte": 0.0, "1-7": 0.0, "8-35": 0.0, "36+": 0.0}
+    for K, T, sig, F, oi, sign, dte in legs:
+        g = sign * _bs_gamma(S0, K, T, sig, F, r) * oi * 100 * S0 * S0 * 0.01
+        by["0dte" if dte == 0 else "1-7" if dte <= 7 else "8-35" if dte <= 35 else "36+"] += g
+    total = sum(by.values())
+    lo, hi, step = DEALER_GRID
+    grid = [S0 * (lo + k * step) for k in range(int(round((hi - lo) / step)) + 1)]
+    vals = [_gex_at(S0, r, legs, x) for x in grid]
+    flip = None
+    for k in range(1, len(grid)):
+        a, b = vals[k - 1], vals[k]
+        if (a <= 0 < b) or (a >= 0 > b):
+            x = grid[k - 1] + (grid[k] - grid[k - 1]) * (0 - a) / (b - a) if b != a else grid[k]
+            if flip is None or abs(x - S0) < abs(flip - S0):
+                flip = x
+    cw, pw = {}, {}
+    for K, T, sig, F, oi, sign, dte in legs:
+        if dte > 35:
+            continue
+        if sign > 0 and K > S0:
+            cw[K] = cw.get(K, 0) + oi
+        elif sign < 0 and K < S0:
+            pw[K] = pw.get(K, 0) + oi
+    bye = {}
+    for e in d.get("expiries") or []:
+        bye[str(e.get("expiry"))] = [sum(o.get("openInterest") or 0 for o in e.get("calls") or []),
+                                     sum(o.get("openInterest") or 0 for o in e.get("puts") or [])]
+    return {"spot": round(S0, 2), "asOf": d.get("asOf"), "gex": round(total), "byTenor": {k: round(v) for k, v in by.items()},
+            "flip": round(flip, 2) if flip else None, "flipPct": round((flip / S0 - 1) * 100, 2) if flip else None,
+            "callWall": max(cw, key=lambda k: (cw[k], -abs(k - S0))) if cw else None,      # ties: the strike nearest the price
+            "putWall": max(pw, key=lambda k: (pw[k], -abs(k - S0))) if pw else None,
+            "callOI": sum(v[0] for v in bye.values()), "putOI": sum(v[1] for v in bye.values()), "byExpiry": bye, "legs": len(legs)}
+
+
+def dealer_change(cur, prev):
+    """z209: put / call open interest on the expiries both days hold, today vs the prior row -> {callChgPct, putChgPct,
+    common, prior} or None."""
+    if not cur or not prev:
+        return None
+    a, b = cur.get("byExpiry") or {}, prev.get("byExpiry") or {}
+    common = [e for e in a if e in b]
+    c0, c1 = sum(b[e][0] for e in common), sum(a[e][0] for e in common)
+    p0, p1 = sum(b[e][1] for e in common), sum(a[e][1] for e in common)
+    if not common or not c0 or not p0:
+        return None
+    return {"callChgPct": round((c1 / c0 - 1) * 100, 2), "putChgPct": round((p1 / p0 - 1) * 100, 2), "common": len(common),
+            "prior": prev.get("d")}
+
+
 # ---- z196: the app's per-name signal and market read, precomputed -------------------------------------------------
 def _num(v):
     return v is not None and isinstance(v, (int, float)) and math.isfinite(v)
@@ -1224,6 +1360,41 @@ def build_outputs(have, now=None):
                        "breadth / sectors = every fresh chain; invertedShare = 90-day minus 30-day ATM IV below -1 pt; "
                        "skewHighShare = 25-delta put minus call IV >= 6 pts; ivRankHighShare = IV rank >= 80 (needs 30 names with 20+ days); "
                        "noQuotes = fresh chains fetched with live quotes on under 20 % of contracts - left out (z208)."}
+    # z209: dealer gamma for the index ETFs, and the day-over-day change in their open interest
+    dealer, dhist = {}, [h for h in (prev.get("dealerHistory") or []) if isinstance(h, dict) and h.get("d") and h.get("sym")]
+    for t in DEALER_SYMS:
+        try:
+            with open(os.path.join(OPTIONS_DIR, f"{t}.json")) as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        q = quote_quality(d)
+        if _age_days(d.get("asOf"), now) > 2 or (q is not None and q < QQ_MIN):
+            continue
+        try:
+            g = dealer_gamma(d)
+        except Exception as e:
+            print(f"  dealer gamma failed for {t}: {e}")
+            g = None
+        if not g:
+            continue
+        older = sorted((h for h in dhist if h["sym"] == t and h["d"] < day), key=lambda h: h["d"])
+        dealer[t] = dict({k: v for k, v in g.items() if k != "byExpiry"}, change=dealer_change(g, older[-1]) if older else None)
+        dhist = [h for h in dhist if not (h["sym"] == t and h["d"] == day)]
+        dhist.append({"d": day, "sym": t, "gex": g["gex"], "flip": g["flip"], "spot": g["spot"], "callOI": g["callOI"],
+                      "putOI": g["putOI"], "byExpiry": g["byExpiry"]})
+    dhist.sort(key=lambda h: (h["d"], h["sym"]))
+    for t in DEALER_SYMS:                                    # byExpiry only where tomorrow's change needs it (the last 3 rows)
+        for h in [h for h in dhist if h["sym"] == t][:-3]:
+            h.pop("byExpiry", None)
+    market["dealer"] = dealer
+    market["dealerHistory"] = dhist[-DEALER_KEEP * len(DEALER_SYMS):]
+    market["dealerMethod"] = ("open interest x Black-Scholes gamma on each contract's own IV (parity mid, else a quoted Yahoo IV), "
+                              "in USD per 1 % move (OI x gamma x 100 x S^2 x 1 %); calls +, puts - (assumes dealers are long the "
+                              "calls customers sell and short the puts they buy); the expiries on file (the nearest, ~30-day, "
+                              "monthlies to 120 days, LEAPs) within +-25 % strikes; flip = where the total crosses zero as the "
+                              "price moves (IVs held); walls = the largest call OI above / put OI below the price within 35 days; "
+                              "OI is Yahoo's prior-session figure (OCC), so its change is the prior session's trading")
     signals = {"asOf": _now_iso(), "fields": ["iv", "skew", "termSlope", "ivSignal", "refDte", "day"], "tickers": sigs}
     return summ, signals, market
 
