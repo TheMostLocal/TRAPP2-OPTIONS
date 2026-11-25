@@ -55,6 +55,25 @@ z196 (owner, 11-19: "all options from the whole ticker universe"):
                      universe breadth (median 30-day IV, share inverted, skew, IV rank >= 80, put/call OI, unusual
                      put vs call activity), the same by sector, and a daily history (the early-warning engine's input)
   • manifest.json lists tickers only (run_report.json was listed as a ticker).
+
+z208 - NO QUOTES, NO VOLATILITY. options.yml's 1630 ET backstop started ~11 h late (0327 ET 11-24; its gate read the
+cron's intended time, not the clock) and fetched every chain with no live quotes - Yahoo answers bid = ask = 0 overnight
+and fills impliedVolatility with placeholders (1e-05 and powers of two: 6.25 %, 3.125 %, 1.5625 %, 0.78 % ...). 1,305
+of 1,919 names were written with a 30-day ATM IV of 0.04-6 % (AA 1.6 %, ABBV 0.8 %, FCX ~2 %), the surfaces took an
+11-24 snapshot from them, the per-name signals read them as "calm IV" (+0.5 - the bot added that to 1,435 names), the
+breadth said the median stock's 30-day IV was 1.6 %, and the run marked the day's broad pass done, so that evening's
+broad pass never ran. And IV rank compared today's IV as a fraction (0.22) with a history in percent (22.0): all 61
+ranked names showed -2 to -655 (percentile 0), and the early warning's "IV rank >= 80" share was always 0. Now:
+  • yahoo_iv(o): Yahoo's IV only for a contract with a quote (bid or ask > 0) and never a placeholder; _row stores
+    iv / Greeks as None otherwise; _iv_of, the summary, the surfaces and the app signal read through it (old files too)
+  • a chain fetched with live quotes on under QQ_MIN (20 %) of its contracts never replaces one that had them (kept,
+    reported); written only when nothing better is on file, flagged noQuotes, and it adds no surface snapshot
+  • a broad pass runs only inside BROAD_WINDOW_ET (1600-2000 ET, weekdays; OPTIONS_BROAD_ANYTIME=1 to override)
+  • clean_snapshots: a snapshot from a known bad pass (SURF_BAD_DAYS: 11-24) under 30 % of the name's usual level, and
+    any one-day collapse that reverses (under 30 % of both neighbours), are dropped - the broad pass sweeps every file
+  • IV rank: today's constant-maturity 30-day ATM IV (the history's own construct, in percent)
+  • summary / breadth / market read: chains without quotes are flagged and kept out; market.json history rows whose
+    median 30-day IV is under 5 % (impossible across ~2,000 stocks) are dropped
 """
 import json
 import math
@@ -147,6 +166,11 @@ MARKET_MAX_AGE_D = 5                                              # chains older
 STALE_CHAIN_DAYS = 21                                             # no price + a chain this old = a dead symbol
 MARKET_HISTORY_KEEP = 520
 MKT_OPT_INDEXES = ("SPY", "QQQ", "IWM")                           # the app's index proxies (computeOptionsMarketSignal)
+QQ_MIN = float(os.environ.get("QQ_MIN", "20"))                    # z208: % of contracts with a clean two-sided quote for "live"
+BROAD_WINDOW_ET = os.environ.get("BROAD_WINDOW_ET", "16:00-20:00")  # z208: when a broad pass may fetch (quotes still up)
+PLACEHOLDER_IV = {0.0625, 0.0313, 0.0312, 0.0156, 0.0078, 0.0039}   # Yahoo's no-quote IVs as stored (4 dp)
+SURF_BAD_DAYS = {"2026-11-24": "a pre-market broad pass with no live quotes (0327 ET; Yahoo's placeholder IVs)"}
+SURF_OUTLIER = 0.30                                               # a snapshot under 30 % of its reference level
 META_FILES = {"manifest.json", "summary.json", "run_report.json", "market.json", "signals.json"}
 _TICKER_FILE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}\.json$")
 ET = ZoneInfo("America/New_York")
@@ -436,6 +460,22 @@ def _select_expiries(all_exps, today, lite=False):
     return ordered[:MAX_EXPIRIES]
 
 
+def yahoo_iv(o):
+    """z208: Yahoo's impliedVolatility when it means something - the contract has a quote (bid or ask > 0) and the figure
+    is not a placeholder (Yahoo fills 1e-05 or a power of two - 6.25 %, 3.125 %, 1.5625 % ... - when it has nothing to
+    imply from: bid = ask = 0 overnight). None otherwise."""
+    v = o.get("iv")
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not (0.005 < v < 5):
+        return None
+    if (o.get("bid") or 0) <= 0 and (o.get("ask") or 0) <= 0:
+        return None
+    if v <= 0.0625:
+        k = math.log2(v)
+        if abs(k - round(k)) < 1e-9 or round(v, 4) in PLACEHOLDER_IV:
+            return None
+    return v
+
+
 def _row(opt_type, rec, S, T, r):
     strike = _safe(rec.get("strike"))
     if strike is None or strike <= 0:
@@ -444,7 +484,7 @@ def _row(opt_type, rec, S, T, r):
     bid = _safe(rec.get("bid"), 0.0)
     ask = _safe(rec.get("ask"), 0.0)
     mid = round((bid + ask) / 2.0, 4) if (bid or ask) else last
-    iv = _safe(rec.get("impliedVolatility"), 0.0)
+    iv = yahoo_iv({"iv": _safe(rec.get("impliedVolatility"), 0.0), "bid": bid, "ask": ask}) or 0.0   # z208: no quote, no IV
     vol = int(_safe(rec.get("volume"), 0) or 0)
     oi = int(_safe(rec.get("openInterest"), 0) or 0)
     if vol == 0 and oi < MIN_OI:
@@ -467,7 +507,7 @@ def _row(opt_type, rec, S, T, r):
         "mid": mid,
         "volume": vol,
         "openInterest": oi,
-        "iv": round(iv, 4),
+        "iv": round(iv, 4) if iv else None,
         "inTheMoney": itm,
         "delta": d, "gamma": g, "theta": th, "vega": ve, "rho": rho,
         "intrinsic": round(intrinsic, 2),
@@ -556,9 +596,9 @@ def parity_iv(d):
 
 
 def _iv_of(o):
-    """Preferred IV for surfaces: parity-consistent mid IV, else Yahoo's."""
+    """Preferred IV for surfaces: parity-consistent mid IV, else Yahoo's when it has a quote behind it (z208)."""
     v = o.get("ivMid")
-    return v if v else o.get("iv")
+    return v if v else yahoo_iv(o)
 
 
 class FetchError(Exception):
@@ -740,10 +780,76 @@ def constant_maturity_surface(d):
     return grid if any(v is not None for r in grid for v in r) else None
 
 
+def _snap_level(sn):
+    """A snapshot's level: the median of its at-the-money column (else of the whole grid), in IV points."""
+    try:
+        i100 = SURF_M.index(1.00)
+        col = [row[i100] for row in sn.get("iv") or [] if row and row[i100] is not None]
+    except (ValueError, IndexError, TypeError):
+        col = []
+    vals = col or [v for row in (sn.get("iv") or []) for v in (row or []) if v is not None]
+    if not vals:
+        return None
+    vals = sorted(vals)
+    n = len(vals)
+    return vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+
+def clean_snapshots(snaps):
+    """z208 -> (kept, dropped [(date, why)]). Drops (1) a snapshot on a known bad day (SURF_BAD_DAYS) under SURF_OUTLIER
+    of the median level of the name's other snapshots (2+ of them), (2) any snapshot - never the latest - under
+    SURF_OUTLIER of BOTH its neighbours: a one-day collapse that reverses is bad data (a real one - a takeover - stays)."""
+    lv = [_snap_level(sn) for sn in snaps]
+    drop = set()
+    for i, sn in enumerate(snaps):
+        x = lv[i]
+        if x is None:
+            continue
+        if sn.get("date") in SURF_BAD_DAYS:
+            others = sorted(v for j, v in enumerate(lv) if j != i and v is not None and snaps[j].get("date") not in SURF_BAD_DAYS)
+            if len(others) >= 2:
+                ref = others[len(others) // 2] if len(others) % 2 else 0.5 * (others[len(others) // 2 - 1] + others[len(others) // 2])
+                if x < SURF_OUTLIER * ref:
+                    drop.add(i)
+                    continue
+        if 0 < i < len(snaps) - 1 and lv[i - 1] and lv[i + 1] and x < SURF_OUTLIER * lv[i - 1] and x < SURF_OUTLIER * lv[i + 1]:
+            drop.add(i)
+    return [sn for i, sn in enumerate(snaps) if i not in drop], \
+        [(snaps[i].get("date"), SURF_BAD_DAYS.get(snaps[i].get("date")) or "a one-day collapse that reversed") for i in sorted(drop)]
+
+
+def sweep_surfaces():
+    """z208: clean_snapshots over every surface file (the broad pass, once a day) -> {date: files repaired}."""
+    out = {}
+    try:
+        names = [f for f in os.listdir(SURF_DIR) if f.endswith(".json")]
+    except FileNotFoundError:
+        return out
+    for f in names:
+        p = os.path.join(SURF_DIR, f)
+        try:
+            with open(p) as fh:
+                h = json.load(fh)
+        except Exception:
+            continue
+        kept, dropped = clean_snapshots(h.get("snapshots") or [])
+        if not dropped:
+            continue
+        h["snapshots"] = kept
+        with open(p, "w") as fh:
+            json.dump(h, fh, separators=(",", ":"))
+        for dte, _why in dropped:
+            out[dte] = out.get(dte, 0) + 1
+    return out
+
+
 def update_surface_history(ticker, d, keep=None):
     """keep: snapshots kept (SURF_KEEP; z196: SURF_KEEP_TAIL for lite-ladder names - 2,000 tail files x a year of
-    daily grids would be ~250 MB in the repo)."""
+    daily grids would be ~250 MB in the repo). z208: a chain without live quotes adds no snapshot."""
     keep = keep or (SURF_KEEP_TAIL if d.get("ladder") == "lite" else SURF_KEEP)
+    q = quote_quality(d)
+    if q is not None and q < QQ_MIN:
+        return False
     grid = constant_maturity_surface(d)
     if not grid:
         return False
@@ -758,6 +864,7 @@ def update_surface_history(ticker, d, keep=None):
     snaps = [s for s in (h.get("snapshots") or []) if s.get("date") != day]   # one per day (latest wins)
     snaps.append({"date": day, "spot": d.get("spot"), "iv": grid})
     snaps.sort(key=lambda s: s["date"])
+    snaps, _dropped = clean_snapshots(snaps)
     out = {"ticker": ticker, "moneyness": SURF_M, "tenorsDays": SURF_TENORS,
            "method": "constant-maturity; OTM smile (put/call average within ±2.5% of spot), total-variance across expiries; no extrapolation",
            "snapshots": snaps[-keep:]}
@@ -792,14 +899,19 @@ def _iv_at_delta(rows, target):
 
 def iv_rank(ticker, atm30):
     """IV rank / percentile of today's 30-day ATM IV within the stored surface
-    history (data/surfaces/<T>.json, 30d tenor at 100% moneyness). Needs 20+ days."""
+    history (data/surfaces/<T>.json, 30d tenor at 100% moneyness). Needs 20+ days.
+    z208: atm30 in IV POINTS like the history (22.17, not 0.2217) - summarize_chain passes today's constant-maturity
+    30-day ATM value (the history's own construct), else the 30-day expiry's ATM IV x 100."""
     try:
         with open(os.path.join(SURF_DIR, f"{ticker}.json")) as f:
             h = json.load(f)
         i30, i100 = h["tenorsDays"].index(30), h["moneyness"].index(1.00)
-        hist = [sn["iv"][i30][i100] for sn in h.get("snapshots") or [] if sn.get("iv") and sn["iv"][i30][i100] is not None]
+        snaps, _bad = clean_snapshots(h.get("snapshots") or [])     # z208: a bad snapshot never sets the range
+        hist = [sn["iv"][i30][i100] for sn in snaps if sn.get("iv") and sn["iv"][i30][i100] is not None]
     except Exception:
         return None
+    if atm30 is not None and atm30 < 3:                     # a fraction slipped in (0.22): IV points, like the history
+        atm30 = atm30 * 100
     if atm30 is None or len(hist) < 20:
         return {"n": len(hist)}
     lo, hi = min(hist), max(hist)
@@ -868,7 +980,16 @@ def summarize_chain(d):
         out["dte30"] = e30.get("dte")
     if a30 and a90 and e90 is not e30:
         out["termSlope"] = round(a90 - a30, 4)                                  # + = contango (normal), − = inverted (stress)
-    out["ivRank"] = iv_rank(d.get("ticker"), a30)
+    cm = None
+    try:                                                      # z208: today's constant-maturity 30-day ATM, in IV points
+        g = constant_maturity_surface(d)
+        cm = g[SURF_TENORS.index(30)][SURF_M.index(1.00)] if g else None
+    except (ValueError, IndexError, TypeError):
+        cm = None
+    out["ivRank"] = iv_rank(d.get("ticker"), cm if cm is not None else (a30 * 100 if a30 else None))
+    q = quote_quality(d)
+    if q is not None and q < QQ_MIN:
+        out["noQuotes"] = True                                # z208: no live quotes - kept out of every IV read
     out["unusual"] = unusual_activity(d)
     out["quoteQualityPct"] = quote_quality(d)
     if d.get("ladder"):
@@ -899,17 +1020,19 @@ def app_signal(d):
     exps = sorted(exps, key=lambda e: e.get("dte") if e.get("dte") is not None else 9999)
     ref = next((e for e in exps if 20 <= (e.get("dte") or 0) <= 60), exps[0])
     ac, ap = _atm_row(ref.get("calls"), spot), _atm_row(ref.get("puts"), spot)
-    ivs = [x.get("iv") for x in (ac, ap) if x and _num(x.get("iv"))]
+    yc, yp = (yahoo_iv(ac) if ac else None), (yahoo_iv(ap) if ap else None)     # z208: no quote / a placeholder -> no IV
+    ivs = [x for x in (yc, yp) if x]
     if not ivs:
         return None
     iv = sum(ivs) / len(ivs)
-    skew = (ap["iv"] - ac["iv"]) if (ap and ac and _num(ap.get("iv")) and _num(ac.get("iv"))) else None
+    skew = (yp - yc) if (yp and yc) else None
     term = None
     far = next((e for e in exps if (e.get("dte") or 0) >= 100), None)
     if far:
         fa = _atm_row(far.get("calls"), spot)
-        if fa and _num(fa.get("iv")):
-            term = iv - fa["iv"]
+        yf_ = yahoo_iv(fa) if fa else None
+        if yf_:
+            term = iv - yf_
     s = 0.0
     if iv > 0.45:
         s = -min(1.0, (iv - 0.45) / 0.45)
@@ -1055,12 +1178,15 @@ def build_outputs(have, now=None):
         except Exception:
             pass
         day = str(d.get("asOf") or "")[:10]
-        if a:
+        if a and not (s and s.get("noQuotes")):                  # z208: no signal from a chain without live quotes
             sigs[t] = [a["iv"], a["skew"], a["termSlope"], a["ivSignal"], a.get("refDte"), day]
         coi, poi = chain_oi(d)
         items.append({"t": t, "ladder": d.get("ladder") or "full", "age": _age_days(d.get("asOf"), now),
-                      "app": a, "summ": s, "coi": coi, "poi": poi, "sector": (sectors.get(t) or [None])[0]})
-    fresh = [it for it in items if it["age"] <= MARKET_MAX_AGE_D]
+                      "app": a, "summ": s, "coi": coi, "poi": poi, "sector": (sectors.get(t) or [None])[0],
+                      "noQuotes": bool(s and s.get("noQuotes"))})
+    # z208: a chain without live quotes is kept out of the market read and the breadth (its IVs are placeholders)
+    no_quotes = sum(1 for it in items if it["noQuotes"] and it["age"] <= MARKET_MAX_AGE_D)
+    fresh = [it for it in items if it["age"] <= MARKET_MAX_AGE_D and not it["noQuotes"]]
     rows = [dict(a=it["app"], t=it["t"]) for it in fresh if it["app"] and (it["ladder"] == "full" or it["t"] in MKT_OPT_INDEXES)]
     app = market_read([{"ticker": r["t"], "iv": r["a"]["iv"], "skew": r["a"]["skew"], "termSlope": r["a"]["termSlope"],
                         "ivSignal": r["a"]["ivSignal"], "isIndex": r["t"] in MKT_OPT_INDEXES} for r in rows])
@@ -1080,21 +1206,60 @@ def build_outputs(have, now=None):
     except Exception:
         pass
     day = now.astimezone(ET).date().isoformat()
-    hist = [h for h in (prev.get("history") or []) if isinstance(h, dict) and h.get("d") != day]
+    hist = [h for h in (prev.get("history") or []) if isinstance(h, dict) and h.get("d") != day
+            and not (_num(h.get("br")) and h["br"] < 0.05)]     # z208: a median 30-day IV under 5 % = a pass without quotes
+    for h in hist:
+        if h.get("v") is None and h.get("ivr") is not None:
+            h["ivr"] = None                                     # z208: IV rank compared a fraction with IV points - not a reading
     if app or br:
         hist.append({"d": day, "idx": (app or {}).get("indexIV"), "trend": (app or {}).get("marketTrend"),
                      "br": (br or {}).get("medianAtmIv30"), "inv": (br or {}).get("invertedShare"),
                      "sk": (br or {}).get("medianSkew25"), "ivr": (br or {}).get("ivRankHighShare"),
-                     "pc": (br or {}).get("putCallOI"), "upl": (br or {}).get("unusualPutLedShare"), "n": (br or {}).get("n")})
+                     "pc": (br or {}).get("putCallOI"), "upl": (br or {}).get("unusualPutLedShare"), "n": (br or {}).get("n"), "v": 2})
     hist.sort(key=lambda h: h["d"])
-    market = {"asOf": _now_iso(), "chains": len(items), "fresh": len(fresh),
+    market = {"asOf": _now_iso(), "chains": len(items), "fresh": len(fresh), "noQuotes": no_quotes,
               "ladders": {"full": sum(1 for it in items if it["ladder"] == "full"), "lite": sum(1 for it in items if it["ladder"] == "lite")},
               "appSignal": app, "breadth": br, "sectors": sec, "history": hist[-MARKET_HISTORY_KEEP:],
               "notes": "appSignal = the app's market options read (index ETFs + full-ladder names, chains <= 5 days old); "
                        "breadth / sectors = every fresh chain; invertedShare = 90-day minus 30-day ATM IV below -1 pt; "
-                       "skewHighShare = 25-delta put minus call IV >= 6 pts; ivRankHighShare = IV rank >= 80 (needs 30 names with 20+ days)."}
+                       "skewHighShare = 25-delta put minus call IV >= 6 pts; ivRankHighShare = IV rank >= 80 (needs 30 names with 20+ days); "
+                       "noQuotes = fresh chains fetched with live quotes on under 20 % of contracts - left out (z208)."}
     signals = {"asOf": _now_iso(), "fields": ["iv", "skew", "termSlope", "ivSignal", "refDte", "day"], "tickers": sigs}
     return summ, signals, market
+
+
+def broad_window_ok(now_utc):
+    """z208: a broad pass fetches only on a weekday inside BROAD_WINDOW_ET ("16:00-20:00" ET) - after the close, while
+    Yahoo still shows the closing quotes."""
+    et = now_utc.astimezone(ET)
+    if et.weekday() >= 5:
+        return False
+    try:
+        a, b = BROAD_WINDOW_ET.split("-")
+        lo = int(a.split(":")[0]) * 60 + int(a.split(":")[1])
+        hi = int(b.split(":")[0]) * 60 + int(b.split(":")[1])
+    except (ValueError, IndexError):
+        lo, hi = 16 * 60, 20 * 60
+    m = et.hour * 60 + et.minute
+    return lo <= m < hi
+
+
+def keep_previous(ticker, data, now):
+    """z208: the reason to keep the chain on file instead of `data`, or None. Kept when the new chain has live quotes on
+    under QQ_MIN % of its contracts, the one on file had QQ_MIN %+ (and twice the new one's) and is <= MARKET_MAX_AGE_D old."""
+    q_new = quote_quality(data)
+    if q_new is None or q_new >= QQ_MIN:
+        return None
+    try:
+        with open(os.path.join(OPTIONS_DIR, f"{ticker}.json")) as f:
+            prev = json.load(f)
+    except Exception:
+        return None
+    q_prev = quote_quality(prev)
+    if q_prev is None or q_prev < QQ_MIN or q_prev < 2 * q_new or _age_days(prev.get("asOf"), now) > MARKET_MAX_AGE_D:
+        return None
+    return (f"no live quotes ({q_new:.0f}% two-sided at {now.astimezone(ET):%H:%M} ET) - the "
+            f"{str(prev.get('asOf') or '')[:16].replace('T', ' ')} UTC chain ({q_prev:.0f}%) kept")
 
 
 def _write_json(name, obj, compact=True):
@@ -1113,6 +1278,12 @@ def main():
     pinned_run = bool(os.environ.get("OPTIONS_TICKERS"))
     now = datetime.datetime.now(datetime.timezone.utc)
     today = now.astimezone(ET).date()
+    if tier == "broad" and not pinned_run and not broad_window_ok(now) and os.environ.get("OPTIONS_BROAD_ANYTIME") != "1":
+        # z208: overnight / pre-market Yahoo answers with no quotes (bid = ask = 0, placeholder IVs) - a broad pass then
+        # would overwrite good chains and mark the day's pass done (0327 ET 11-24)
+        print(f"Broad pass refused: {now.astimezone(ET):%a %H:%M} ET is outside the broad window ({BROAD_WINDOW_ET} ET, weekdays) - "
+              "Yahoo's option quotes aren't up; nothing fetched, tonight's state untouched (OPTIONS_BROAD_ANYTIME=1 overrides).")
+        return 0
     # z114: oldest chains first, so a run that hits the time budget still rotates through the whole universe across
     # runs. z196: ages come from the last summary.json (one file) instead of opening 2,300 chains.
     prev_asof = {}
@@ -1198,6 +1369,16 @@ def main():
                     pass
             continue
         noopt.pop(ticker, None)
+        held = keep_previous(ticker, data, now)
+        if held:
+            # z208: fetched with no live quotes while the chain on file had them - the good one stays
+            report["keptStale"].append({"ticker": ticker, "error": held})
+            report["noQuotes"] = report.get("noQuotes", 0) + 1
+            continue
+        q_new = quote_quality(data)
+        if q_new is not None and q_new < QQ_MIN:
+            data["noQuotes"] = True                                  # nothing better on file: written, flagged, no surface
+            report["noQuotes"] = report.get("noQuotes", 0) + 1
         report["written"].append(ticker)
         report["lite"] += 1 if lite else 0
         with open(os.path.join(OPTIONS_DIR, f"{ticker}.json"), "w") as f:
@@ -1210,6 +1391,21 @@ def main():
             print(f"  …{len(report['written'])} written ({i+1}/{len(order)}) · {round(time.time() - start)} s")
     if json.dumps(noopt, sort_keys=True) != noopt_before or not os.path.exists(_noopt_path()):
         _save_noopt(noopt)
+    st0 = {}
+    try:
+        with open(os.path.join(OPTIONS_DIR, "_state.json")) as f:
+            st0 = json.load(f) or {}
+    except Exception:
+        pass
+    if not pinned_run and (st0.get("surfaceSweep") or {}).get("date") != today.isoformat():
+        try:                                                         # z208: bad snapshots out of every surface file, daily
+            fixed = sweep_surfaces()
+            report["surfacesRepaired"] = fixed
+            st0["surfaceSweep"] = {"date": today.isoformat(), "repaired": fixed}
+            _write_json("_state.json", st0, compact=False)
+            print("Surface sweep: " + (", ".join(f"{d} {n} dropped" for d, n in sorted(fixed.items())) or "nothing to drop"))
+        except Exception as e:
+            print(f"  surface sweep failed: {e}")
     if tier == "broad" and not pinned_run and len(universe) >= 200:
         # z196: a chain no list asks for any more (dropped from every book, the requests and the core list) and weeks
         # old is removed - it would sit in the manifest forever (the 10-15 chains). Its surface history is kept.
@@ -1245,7 +1441,8 @@ def main():
         _write_json("_state.json", st, compact=False)
     _step_summary(report, summ)
     print(f"Done — {len(report['written'])} written ({report['lite']} lite), {len(report['noOptions'])} without options, "
-          f"{len(report['keptStale'])} kept from the previous run (errors), {len(report['notReached'])} not reached, "
+          f"{len(report['keptStale'])} kept from the previous run (errors / no live quotes: {report.get('noQuotes', 0)}), "
+          f"{len(report['notReached'])} not reached, "
           f"{report['skippedFresh']} fresh skipped, {len(have)} total with chains · {report['seconds']}s")
     return 0
 
