@@ -1,7 +1,8 @@
 """Offline tests for pipeline/fetch_options.py (z114). Run: python tests/test_options.py
 No network: yfinance is stubbed; chains are synthesized with Black-76.
 z208: section 9 - no quotes, no volatility (Yahoo's placeholders, the write guard, the broad window, the surface repair,
-IV rank in IV points, the breadth without quote-less chains)."""
+IV rank in IV points, the breadth without quote-less chains). z209: section 10 - the 30-day hole in the full ladder,
+dealer gamma (signs, one contract by hand, the flip between the walls, 0DTE after the close, the OI change)."""
 import sys, os, json, math, types, tempfile, shutil
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "pipeline"))
@@ -316,6 +317,76 @@ T("market.json history: an old row's IV-rank share (computed in the wrong units)
 sg10 = json.load(open(os.path.join(fo.OPTIONS_DIR, "signals.json"))) if os.path.exists(os.path.join(fo.OPTIONS_DIR, "signals.json")) else {"tickers": {}}
 _, sig10, _ = fo.build_outputs(fo.chain_files())
 T(f"signals.json: no row for a quote-less chain (NEWD), the live one kept (KEEP): {sorted(sig10['tickers'])}", "NEWD" not in sig10["tickers"] and "KEEP" in sig10["tickers"])
+shutil.rmtree(tmp)
+
+# 10. z209 - the 30-day hole; dealer gamma
+today = _dt.date(2026, 11, 25)
+spy_exps, dd_ = [], today
+while dd_ <= _dt.date(2026, 12, 31):                                  # daily expiries to year end (SPY-like)
+    if dd_.weekday() < 5 and dd_ not in (_dt.date(2026, 11, 26), _dt.date(2026, 12, 25)):
+        spy_exps.append(dd_.isoformat())
+    dd_ += _dt.timedelta(days=1)
+for m in range(1, 13):
+    f = _dt.date(2027, m, 15); f += _dt.timedelta(days=(4 - f.weekday()) % 7); spy_exps.append(f.isoformat())
+spy_exps += ["2027-12-17", "2028-01-21", "2028-12-15", "2029-01-19"]
+lad = fo._select_expiries(sorted(set(spy_exps)), today)
+ld = [(_dt.date.fromisoformat(e) - today).days for e in lad]
+T(f"full ladder for daily expiries: December's monthly (23 d) and one near 30 days in ({ld})", "2026-12-18" in lad and any(26 <= x <= 34 for x in ld))
+T(f"... within the cap ({len(lad)} <= {fo.MAX_EXPIRIES}), furthest kept, chronological", len(lad) <= fo.MAX_EXPIRIES and lad[-1] == "2029-01-19" and lad == sorted(lad))
+small = ["2026-11-27", "2026-12-18", "2027-01-15", "2027-06-18"]
+T("a name with few expiries keeps them all", fo._select_expiries(small, today) == small)
+
+def oi_chain(call_oi, put_oi, S=100.0, dte=21, asof="2026-11-25T18:00:00Z", sig=0.25, r=0.04):
+    """One expiry, strikes 80-120 every 1, two-sided Black-76 quotes (so parity gives every contract an ivMid)."""
+    T_ = max(dte, 0.5) / 365.0
+    F = S * math.exp(r * T_)
+    calls, puts = [], []
+    for K in range(80, 121):
+        for typ, arr, oi in (("call", calls, call_oi(K)), ("put", puts, put_oi(K))):
+            p = fo._b76(typ, F, K, T_, r, sig)
+            arr.append({"strike": float(K), "bid": round(p * 0.995, 4), "ask": round(p * 1.005, 4) + 0.01, "mid": round(p, 4),
+                        "iv": sig, "volume": 10, "openInterest": oi})
+    dd = {"ticker": "SYN", "spot": S, "asOf": asof, "riskFreeRate": r,
+          "expiries": [{"expiry": "2026-12-16", "dte": dte, "calls": calls, "puts": puts}]}
+    return fo.parity_iv(dd)
+g_call = fo.dealer_gamma(oi_chain(lambda k: 1000, lambda k: 0))
+g_put = fo.dealer_gamma(oi_chain(lambda k: 0, lambda k: 1000))
+T(f"dealer gamma: calls only positive ({g_call['gex']:,}), puts only negative ({g_put['gex']:,}), same size", g_call["gex"] > 0 > g_put["gex"] and abs(g_call["gex"] + g_put["gex"]) / g_call["gex"] < 0.05)
+# by hand: Black-Scholes spot gamma, and the total = sum of OI x gamma x 100 x S^2 x 1 % over the contracts
+Tn, Fn = 21 / 365, 100 * math.exp(0.04 * 21 / 365)
+d1n = (math.log(Fn / 100) + 0.5 * 0.25 ** 2 * Tn) / (0.25 * math.sqrt(Tn))
+want = math.exp(-0.04 * Tn) * (Fn / 100) * fo._norm_pdf(d1n) / (100 * 0.25 * math.sqrt(Tn))
+T(f"spot gamma by hand: {fo._bs_gamma(100, 100, Tn, 0.25, Fn, 0.04):.6f} vs {want:.6f}", abs(fo._bs_gamma(100, 100, Tn, 0.25, Fn, 0.04) - want) < 1e-12)
+cc = oi_chain(lambda k: 1000, lambda k: 0)
+tot = sum(1000 * fo._bs_gamma(100, o["strike"], Tn, fo._iv_of(o), cc["expiries"][0]["forward"], 0.04) * 100 * 100 ** 2 * 0.01 for o in cc["expiries"][0]["calls"])
+T(f"dealer gamma = the sum over contracts ({g_call['gex']:,} vs {round(tot):,})", abs(g_call["gex"] - tot) < 2)
+mixed = fo.dealer_gamma(oi_chain(lambda k: 3000 - (k - 105) * 100 if k >= 105 else 50, lambda k: 3000 - (95 - k) * 100 if k <= 95 else 50))
+T(f"dealer gamma: puts below / calls above (OI fading away from the money) -> a flip between the walls ({mixed['flip']}, walls {mixed['putWall']} / {mixed['callWall']})",
+  mixed["flip"] and 90 < mixed["flip"] < 110 and mixed["callWall"] == 105 and mixed["putWall"] == 95)
+z0 = oi_chain(lambda k: 1000, lambda k: 0, dte=0, asof="2026-11-25T21:30:00Z"); z0["expiries"][0]["expiry"] = "2026-11-25"
+T("dealer gamma: an expiring chain read after the close counts nothing (None)", fo.dealer_gamma(z0) is None)
+z1 = oi_chain(lambda k: 1000, lambda k: 0, dte=0, asof="2026-11-25T17:00:00Z"); z1["expiries"][0]["expiry"] = "2026-11-25"
+g1 = fo.dealer_gamma(z1)
+T(f"dealer gamma: in the session 0DTE counts, in its own bucket ({g1['byTenor']['0dte']:,})", g1 and g1["byTenor"]["0dte"] == g1["gex"] > 0)
+ch = fo.dealer_change({"byExpiry": {"2026-12-18": [100, 200], "2027-01-15": [50, 100], "2026-11-27": [999, 999]}},
+                      {"d": "2026-11-24", "byExpiry": {"2026-12-18": [90, 220], "2027-01-15": [50, 100], "2026-11-25": [500, 500]}})
+T(f"dealer change on the common expiries only ({ch})", ch == {"callChgPct": round((150 / 140 - 1) * 100, 2), "putChgPct": round((300 / 320 - 1) * 100, 2), "common": 2, "prior": "2026-11-24"})
+tmp = tempfile.mkdtemp()
+fo.DATA_DIR, fo.OPTIONS_DIR, fo.SURF_DIR = tmp, os.path.join(tmp, "options"), os.path.join(tmp, "surfaces")
+os.makedirs(fo.OPTIONS_DIR)
+nowiso = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+spyc = oi_chain(lambda k: 3000 if k >= 105 else 50, lambda k: 3000 if k <= 95 else 50, asof=nowiso); spyc["ticker"] = "SPY"
+json.dump(spyc, open(os.path.join(fo.OPTIONS_DIR, "SPY.json"), "w"))
+prior_day = (_dt.datetime.now(fo.ET).date() - _dt.timedelta(days=1)).isoformat()
+json.dump({"history": [], "dealerHistory": [{"d": prior_day, "sym": "SPY", "gex": 1, "flip": 100, "spot": 100, "callOI": 1, "putOI": 1,
+                                             "byExpiry": {"2026-12-16": [40000, 50000]}}]}, open(os.path.join(fo.OPTIONS_DIR, "market.json"), "w"))
+_, _, mk11 = fo.build_outputs(fo.chain_files())
+dl = (mk11.get("dealer") or {}).get("SPY") or {}
+T(f"market.json dealer: SPY's gamma, flip, walls and the change vs the prior row ({dl.get('change')})",
+  dl.get("gex") is not None and dl.get("flip") and (dl.get("change") or {}).get("prior") == prior_day and "byExpiry" not in dl)
+T("market.json dealerHistory: today's row added beside the prior one; the method said", len(mk11["dealerHistory"]) == 2 and "assumes dealers" in mk11["dealerMethod"])
+tie = fo.dealer_gamma(oi_chain(lambda k: 3000 if k >= 105 else 50, lambda k: 3000 if k <= 95 else 50))
+T(f"walls: a tie goes to the strike nearest the price ({tie['putWall']} / {tie['callWall']})", tie["putWall"] == 95 and tie["callWall"] == 105)
 shutil.rmtree(tmp)
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
