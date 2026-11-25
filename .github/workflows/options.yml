@@ -57,6 +57,13 @@ jobs:
             16:30) RUN=true; T=broad ;;
             *) RUN=false; T= ;;
           esac
+          # z208: GitHub starts this account's crons hours late - the 16:30 broad run started at 03:27 ET on 11-24, when
+          # Yahoo shows no option quotes, and wrote 1,305 chains of placeholder IVs. The clock decides, not the schedule.
+          NOWM=$(( 10#$(TZ=America/New_York date +%H) * 60 + 10#$(TZ=America/New_York date +%M) ))
+          if [ "$RUN" = "true" ] && { [ "$NOWM" -lt 960 ] || [ "$NOWM" -ge 1200 ]; }; then
+            echo "late start: $(TZ=America/New_York date +'%a %H:%M') ET is outside 16:00-20:00 ET - the broad pass needs the closing quotes; stood down"
+            RUN=false; T=
+          fi
           echo "schedule '$S' = ${ETH}:${ETM} ET today (UTC${OFF}) -> run=${RUN} tier=${T:-default}"
           echo "run=${RUN}" >> "$GITHUB_OUTPUT"; echo "tier=${T}" >> "$GITHUB_OUTPUT"
   options:
